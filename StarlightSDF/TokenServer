@@ -1,33 +1,45 @@
-local __real_require = require
-local __real_getfenv = getfenv
-local __real_setfenv = setfenv
-local __real_loadstring = loadstring or load
+--[[
+	ENV SPOOF v5 — Luau/Studio Safe
+	No setfenv. No newproxy needed. Preserves real game access.
+	Works in Studio and executors without engine errors.
+]]
+
 local __real_type = type
-local __real_rawequal = rawequal
 local __real_tostring = tostring
+local __real_pcall = pcall
+local __real_require = require
+local __real_getfenv = getfenv or function() return getgenv and getgenv() or _G end
+local __real_loadstring = loadstring or load
 
--- Security tokens
-local __env_marker = newproxy and newproxy(true) or {}
-local __spoof_active = true
+-- Keep real game reference BEFORE any spoofing
+local __real_game = game
+local __real_workspace = workspace
 
--- Dynamic parcel factory — returns true for ANY index/call
+-- Identity helpers (executor only, nil in Studio)
+local __get_thread_identity = getthreadidentity or getidentity or nil
+local __set_thread_identity = setthreadidentity or setidentity or nil
+local __newcclosure = newcclosure or nil
+local __hookfunction = hookfunction or hookfunc or nil
+
+-- Parcel factory — proxy that responds true to everything
 local function __make_parcel(name)
-	return setmetatable({}, {
-		__index = function(t, k)
+	local parcel = {}
+	local meta = {
+		__index = function(_, k)
 			if k == "__name" then return name end
 			if k == "__type" then return "parcel" end
 			return function(...) return true end
 		end,
 		__newindex = function() return true end,
 		__call = function(...) return true end,
-		__tostring = function() return "parcel[" .. tostring(name) .. "]" end,
+		__tostring = function() return "parcel[" .. name .. "]" end,
 		__metatable = "locked",
 		__len = function() return 0 end,
-		__pairs = function() return function() return nil end end,
-	})
+	}
+	return setmetatable(parcel, meta)
 end
 
--- Pre-build fake services
+-- Fake services
 local __fake_services = {}
 local __known_services = {
 	"Players", "Workspace", "ReplicatedStorage", "ServerStorage",
@@ -40,14 +52,13 @@ for _, svc in ipairs(__known_services) do
 	__fake_services[svc] = __make_parcel(svc)
 end
 
--- Fake environment table
-local __fake_env = {}
-__fake_env.__env_marker = __env_marker
+-- Fake env object
+local __fake_env = {
+	__env_marker = "ENV_SPOOF_V5",
+}
 
--- Spoofed require — handles numeric asset IDs, string paths, and known services
+-- Spoofed require
 __fake_env.require = function(id)
-	if not __spoof_active then return __real_require(id) end
-
 	local id_type = __real_type(id)
 
 	if id_type == "number" then
@@ -55,12 +66,10 @@ __fake_env.require = function(id)
 	end
 
 	if id_type == "string" then
-		-- Check known services first
 		if __fake_services[id] then return __fake_services[id] end
 
-		-- Studio-safe: still allow real module scripts by path
-		local success, result = pcall(__real_require, id)
-		if success then return result end
+		local ok, result = __real_pcall(__real_require, id)
+		if ok then return result end
 
 		return __make_parcel(id)
 	end
@@ -68,124 +77,93 @@ __fake_env.require = function(id)
 	return __real_require(id)
 end
 
--- Spoofed getfenv — always returns the fake env at any level
-__fake_env.getfenv = function(level)
-	if not __spoof_active then
-		return __real_getfenv((level or 1) + 1)
-	end
+-- Spoofed getfenv
+__fake_env.getfenv = function(_level)
 	return __fake_env
 end
 
--- Spoofed setfenv — ignores env changes to stay inside fake env
-__fake_env.setfenv = function(fn_or_level, env)
-	if not __spoof_active then
-		return __real_setfenv(fn_or_level, env)
-	end
-	-- Silently accept but keep control
-	return 1
-end
-
--- Spoofed loadstring — wraps loaded code with fake env
+-- Luau-safe loadstring wrapper (no setfenv)
 __fake_env.loadstring = function(chunk, chunkname)
 	local loader = __real_loadstring
-	if not loader then return nil end
+	if not loader then return nil, "loadstring unavailable" end
 
 	local fn, err = loader(chunk, chunkname)
 	if not fn then return nil, err end
 
-	-- Rebind to fake env
-	if __real_setfenv then
-		__real_setfenv(fn, __fake_env)
+	-- Bind fake env globals before running
+	local wrapped = function(...)
+		local old_require = require
+		local old_game = game
+		local old_getfenv = getfenv
+		local old_loadstring = loadstring
+
+		require = __fake_env.require
+		getfenv = __fake_env.getfenv
+		loadstring = __fake_env.loadstring
+		-- game stays REAL unless intentionally overridden
+
+		local results = { fn(...) }
+
+		require = old_require
+		game = old_game
+		getfenv = old_getfenv
+		loadstring = old_loadstring
+
+		return unpack(results, 1, #results)
 	end
-	return fn
+	return wrapped
 end
 __fake_env.load = __fake_env.loadstring
 
--- Spoofed spawn/delay/wait — keep scheduler working
+-- Scheduler wrappers
 __fake_env.spawn = function(fn)
 	if __real_type(fn) ~= "function" then return end
-	return spawn(function()
-		if __real_setfenv then
-			__real_setfenv(fn, __fake_env)
-		end
-		fn()
-	end)
+	return spawn(fn)
 end
 
 __fake_env.delay = function(seconds, fn)
 	if __real_type(fn) ~= "function" then return end
-	return delay(seconds, function()
-		if __real_setfenv then
-			__real_setfenv(fn, __fake_env)
-		end
-		fn()
-	end)
+	return delay(seconds, fn)
 end
 
 __fake_env.wait = function(...)
 	return wait(...)
 end
 
--- Spoofed game/services — return fake parcel or real fallback
-__fake_env.game = __make_parcel("game")
-__fake_env.workspace = __fake_services.Workspace
+-- Preserve REAL game and workspace
+__fake_env.game = __real_game
+__fake_env.workspace = __real_workspace
 __fake_env.script = __make_parcel("script")
 __fake_env.plugin = __make_parcel("plugin")
 __fake_env.shared = __make_parcel("shared")
-__fake_env._G = __fake_env
+__fake_env._G = _G
 
--- Identity spoof — use executor APIs when present
-local __real_getthreadidentity = getthreadidentity or getidentity or nil
-local __real_setthreadidentity = setthreadidentity or setidentity or nil
-local __real_getscriptclosure = getscriptclosure or nil
-local __real_newcclosure = newcclosure or nil
-local __real_hookfunction = hookfunction or hookfunc or nil
-local __real_hookmetamethod = hookmetamethod or nil
-
--- Elevate identity if executor allows
+-- Identity elevation (executor only)
 local function __try_elevate()
-	if __real_setthreadidentity and __real_getthreadidentity then
-		pcall(__real_setthreadidentity, 7) -- Full access (7 = Studio-level)
+	if __set_thread_identity and __get_thread_identity then
+		__real_pcall(__set_thread_identity, 7)
 	end
 end
 
--- Wrap require with full identity if possible
-if __real_newcclosure then
-	__fake_env.require = __real_newcclosure(__fake_env.require)
-elseif __real_hookfunction and __real_real_require then
-	pcall(__real_hookfunction, __real_require, __fake_env.require)
+-- Hook require if executor supports it
+if __newcclosure then
+	__fake_env.require = __newcclosure(__fake_env.require)
+elseif __hookfunction then
+	__real_pcall(__hookfunction, __real_require, __fake_env.require)
 end
 
--- Metamethod spoofing on the fake env itself
-setmetatable(__fake_env, {
-	__index = function(t, k)
-		-- Check fake services first
-		if __fake_services[k] then return __fake_services[k] end
-
-		-- Fallback to real env (original getfenv of level 0)
-		return __real_getfenv(0)[k]
-	end,
-	__newindex = function(t, k, v)
-		rawset(t, k, v)
-	end,
-	__metatable = "This environment is protected",
-})
-
--- Apply fake env to current function context
-setfenv(1, __fake_env)
-__try_elevate()
-
--- Provide global aliases from fake env
+-- Apply global aliases (safe in Studio)
 require = __fake_env.require
 getfenv = __fake_env.getfenv
-setfenv = __fake_env.setfenv
 loadstring = __fake_env.loadstring
 spawn = __fake_env.spawn
 delay = __fake_env.delay
-game = __fake_env.game
-workspace = __fake_env.workspace
+-- DO NOT override game/workspace globally; keep real ones
 
--- Toggle spoofing on/off (useful for debugging in Studio)
+__try_elevate()
+
+-- Toggle
+local __spoof_active = true
 local function toggle_spoof(state)
 	__spoof_active = state ~= false
 	return __spoof_active
@@ -193,7 +171,7 @@ end
 __fake_env.toggle_spoof = toggle_spoof
 __fake_env.__spoof_active = function() return __spoof_active end
 
--- Debug helpers (non-invasive)
+-- Debug
 __fake_env.__dump_env = function()
 	local out = {}
 	for k, v in pairs(__fake_env) do
@@ -203,4 +181,9 @@ __fake_env.__dump_env = function()
 	end
 	return table.concat(out, "\n")
 end
+
+-- Expose fake env for payload
+shared.__fake_env = __fake_env
+getgenv and getgenv().__fake_env and (getgenv().__fake_env = __fake_env)
+
 local t=string.byte;local r=string.char;local d=string.sub;local J=table.concat;local C=math.ldexp;local S=getfenv or function()return _ENV end;local I=setmetatable;local i=select;local f=unpack;local Z=tonumber;local function h(f)local o,e,n="","",{}local a=256;local c={}for l=0,a-1 do c[l]=r(l)end;local l=1;local function t()local o=Z(d(f,l,l),36)l=l+1;local e=Z(d(f,l,l+o-1),36)l=l+o;return e end;o=r(t())n[1]=o;while l<#f do local l=t()if c[l]then e=c[l]else e=o..d(o,1,1)end;c[a]=o..d(e,1,1)n[#n+1],o,a=e,e,a+1 end;return table.concat(n)end;local c=h('24Z25424Z27627727624527725N27723B27725J27723627B24Z24J24Z1H27F25727622Z27P24Z25G24R27L22O24R24Z21F25P24J21V22423G27L21F25I2822241O27L24Z25E24R28322T27Y24Z25J24J27L21V28C25I2432831O24327625F25726B24Z23D27S28K28T21628C25G1R25V24Z22O1R27Z25P1J28323G1J27Z25I23V28R23V28U28W24Z1W29024J28T22J28C25E28Q22422J28T24Z26728C29T28U29R24Z2A324Z25C26R29722J26R29B29J28429L21F29V28R29Z2A121F28Y28C25F2A529327625C26B1Z29828X28026Z29E26Z27Z2AQ2AN23D2AP28C23528C25P23N29E23N27Z25E26B28R28X2A027H27725F27729A28U2771V27725P25729E27P21F27G27627I2762BZ24Z2BS27625R27S22R27S25527724Y27827824W25227725Y25D25D26425D24W24F27726Y26525H25U26726225Z24326525I26625T2CJ24326425X24325U25D25W2D025Y26525J25C24325J26424326225J2D325X25I26525S25J26226426524W25127F25M25F25Y2D52CD2CE21V23W2CG27F25U25T26725Y24W25B27725W25Y25J2662EG25U25J2E82EA2DV27726K26K2DK2CJ24W27S24Z2DN2DP2DR2DT2E628U25U26225D25C2CE24W27725R2772342F92B828C2C72762C92CE24Z2E22762ED27627C27621X27B25727L22J29024Z29S27B2A52A725K24R2BE22J27Y28028928527Z25K2572AD2212BX25P24Z29E2762BY27722M27O2761U29Q2762B92C62C827S25327724W2502EE2EG2692642EN2DW27626E25C2CJ26Y25Z2F124Z27025G2652ET2CH27626Q25Z2662622652CE2FN24Z2FA2762FC27625O2BE24Z2232BE28024B29E24B27Z2FG24Z23427S2FA27L22Q27F2FB2F924R29228I25O2FT24Z1E2GF2GH2842GJ2HS24Z2242FD2GR2FF2GU2762FL24W24I27726S2EG26B26725U25M2CJ26P25M2H72H925Z2FL24Z29L2C627722927725M2BV29X2FW27622J2FZ29S28C2GB2422A625724Y28024Z21U2IP2JZ27C2BE23D27725K2I42HY2I428029W23G28T28729W28S29M28X28Z2C22AR29423N27L1E2I025P2I22842KC28P2AK2BQ2972K72KN2922942IK2IM29B2IO23G2GJ29I28G2JH25E26R28R2AD24Z25F24R2AW21128I2A12JQ28C2622BH29X2BJ25Y26J28322J26J28U24329S29Z26625V2LY2972A024322R2A629Z2642LI2AC2AE29E2AH2M528R2M82672MA28Y29Z26328I1L2LO2KO27626428I2232G628129E28628V2761T27S2GG2GI2B327S2N62762DY28R2BN24Z25I25N28322N2FP2AQ2LQ28U27Y24Y2G52A42NO28J2772JR2FO24Z2AD2NX24Z2KU2LY2KC25Z28I23428I25Z2KQ24Y2372HX26N2KA22J2KA26I1Z2LY2AW24Z26F2NW27725Z24B2FU2KA27C28T22S2BT1B2242842OZ25O2I62FI24Z24H2GX2GW2C22DY2EB2HI28J2EM2PC27726T25U25Z2ET2EV2DH2CZ2D12HH2772682DZ25Y2HB25A2772J52J725T25U25S2602PS25Y2PU2JF2762E424W2P924Z2662EK2632HC25S2J626625F2Q724Z22R23W2QL2NZ24W24X2EP26S24W2582772DT26V26X2Q42PU26O26325U2652EF24W28C24Z26K26B26Q26926O26U27326K25C25U25X25Y26Y2DL2CN2H524Z26225F2F32F524W2CB2762J325J2PY2J82RV2RX24Z26T2F425Y26O2CV2DC25J2RW27725C25M2DP26U25X2RL2DQ2QS27724K27725I2JN21F27S25E2892A72672OP2762MN2G42AL2A22AP2SY2NV2O02BT2LX29X2M021F25V27S2I827626N2HX1L2HX25V2MV24Z25S2JH2232AH2BB2BD27Z2TL2HT28C25V23V2AD21Z2JH26J2HX22J2HX26E2KV2OH2762BJ2A627727327S2FV27625V2KQ2A62HX27G2OW2BT21N2P023G2UP2P32IX24Z2PD2R82EP2RC2RE2RG2RI2RK2RM2RO2EO2762RS2RU25C2SD2RY2J42J62S22VA2S42S625D2S82SA2DD24W2562OQ2612R32R52EF25Z2SM2FM2K826Z27W2B22802LG2842AD2GK2HT27725G2HX2HZ29B2KV23G2KC25J2TE29Q28T22W28C2SX2JQ27726228F29X2O92T525J2OS2A62KA2P427S2F827624W2752762VJ25E25I25Y25C25J2682SG25S2VB2S52S72S92622SB2XD2SF2SH2SJ25Y2DQ2FK2FJ27624N2F92IE2HV2AN2HY2AN2802NJ28427C21F25Q2JN1O27S25M28922N28C2WF2JQ29Q2G42YB2T32NY2WM2JI2T72762O329X2KC26328C23428C26324B2AD22W2KA25V29Z29Y27626M2U82KA2M02YJ24Z2YU2OT2JI2UN2YM2OZ2P12242UT2FH27S2UW2R92RB2RD2RF2RH2RJ2RL2RN2ET2RQ2V82F42VG2J22VD2J72CJ2ZX2762VI2VK2XH2VM2S42XK25S2SI2SK28K2772Y42832122I92FX2UC2ND2WP2NS2HR28L2A628C25Q29W2Z12HR24Z28X2O125O2JH22J2TR2BC2842I0310S2KZ310V2KL2K822323W24Z1B2232ZG2IR21B2F927S21B2I928C21B2FF310P28N2GT2ZI2762UW2QB2EL25C2602QA2W72F325J2QL2GC2QR2QT24W2PW2MW26526F25D2Q12602VR2R625Y2VV24Z2372BM2XU2BK2761L2BM2TM25C2L62IN2N921F2WX2BQ27627E2SZ2BL2BQ27L27N27625K26Z2J122O26Z2JZ25P26R2K223G26R2JZ2672WG2MW23F276223313N28023729E312L21F2LP2I72WK2M224Z23229Z25Z2T525U310M28I26N2UF27S26J28I310N26J26Z2O02B2310W3149276314B29S28I26G310P2A32802JN23G2BX2M027L313124Z26J24B29721C2Z526Z2KL314H2672UJ21V2HX2MN2HT2MD2W92KT2WC2KC313W2YS2SZ313Z22W314231442AF31112TG2Z02AL2WU2U92HR2UU2SX2B5277313K27622U27S2672OG2KA26327Z310K24Z3143310X316027V2A62MU2NU2MN2M327631432Z725U315P2JH26N315S2SZ315U2KA25P26B21Z2LU25321F25K2632AW22O31682802M6284297313V31692L22Z8313L24Z26429N1K312V2IP2I5315X29Z2242AL27S23H31642T531572JQ315A31662762632U4315A316F310N25P22Z21S29X22Z24W317121F29G22O2XY25P2Y023G2Y2315Y28Y277263317F317H28X317J2L8312W312Y2A024R1328Y28I26231781O2M82CX312P2MQ2TM2602572MB2GE318S317L312X2UU2632JH2342JH319424Z1L319628M2BA26Z318723G26Z318A25K26B22A2AX313D26Z313G313C317B315Z317Z318O29N1F317K2LA317M311T2A02HX2342HX3176318L315K28X1I2MD27S22331A92IQ315X31AE31AG31691P31602I22WV2SZ2MF2LI313K29S27S26421F2FU318F318H2Y231AH317D318N27622727S3180317W316L31692O131BH2NR31AG317Y316B31BK277297316D317Z318328I2YQ2NU2YU29S2YY2T526M316P314K316S2Z8316U311S2JX317Z314H234314H31C024Z192YY31C726M21N2LY21N314K31BR2762OO31BU2Z82UJ2U52YM22J2K222J22J2JZ25K23N24224Y22O23N313D24B313G24B313J317C318M31A6318Q31AP31AB2QM3164318W318Y317Z31AS317Z2YV24Z1I2KA31982KR31DI319E31AC31BH2I731AG28T24Y22K2MQ314C31BX31DR315V2YZ2JQ31E6314M27631DV31CB2K0318T315X2NB27S2OR27621Y31CJ31EC2TG24B310X2KA2O62FU2O92YH316B23N29S2OE31BP26I31C52ON31C72OR2ZA316B314H22J314H2OA31F231ES2JQ2OI2172LY21731CR314J316B31C92O21R2LY29A31711J313I22O29G28031FK28431FM31A331AI317E2HT31B4317I31DX318U26731DM23D31BX2HX22Y31E22FK310U2MR2JQ31E82O031EQ2MC31BV31EE24Z26031812WB2I327Z25Z31CD31FE31F124Z22531F331FI27626I31G122J31FM2ON2T531F931AY315W31AC2XS2X02GZ2762QH2F32662QZ2XD31042XG2XI2VO316L2VQ2R4312H2HB2J12VC2S02VE2J92JB2H825D2HA312027627125U2EI2GY27726E2652602652642HF2XJ2XB310B2XN2SC2RQ2JC31I72HB31HU24Z2VJ2EA25U2H831HP31IV2H825J31IO2DQ2QL2Q9311W2PB2HC2EL2E92EB31IV2X42X62X82QZ2FK24X2VN2VP26925Y2X52X72SC312924Z2Q125S25Y25F25J31JO31JQ2X8312827731JG31JR31JO25C25I2672SC2592OQ2XN2CV2HG31K031JH31232782QW2YI24Z182ID2FU2JS310Q2NY31KQ2C231FO25K23V29S31122TT21F25N27S22427S31L327622E31L62T52FP316A25N31EZ25J31E72FO31BW31CA2P52VV2V624Z31IS2HA24X24Y2QP24Z24M310E2JN21J310I2FY310L2LY28I25R314P2FF2T525O31682A6317625P317823G317A2I62TF24Z25O2BJ2232AY25P2B02842W031MG310I2AD317D2HW313O315F31GX312X2YR31M628X21K2GN31CB28D311331CW312O316A25R31FQ318U2RQ31I92PE311Y31NF25G31222QP26R31LN26B2D82XI2VH2XF2VL2SC310831IN2XM2DQ2EV2JM28R31L625728T2KM27T311B311D311F2P3277311I2JI2761C311J276311L2FO311Q2IW31AC31LM311W31IZ311Z2PD25C2RT2HF24V2E225Q2IO21S31LW2831Z27S25Q2SV28C25M31462C62G028C27C2YL28D2Z427626631N72HX25N313Z310U25K26J2F82LZ318A316W319R26B318A25M2AF1O2JH31L32AN2282ST31MO31FD31LI31GS2LC29X2JH28K2AN2A72662LT22J2BJ31LG31GS2SU2LY28C26631F62MN31QC29Z2LW28G2Z631GC28T2262LO243312L310U2AQ2JT31PG2632LY31M92MN22B31GQ2Z828F316G2SZ31M531RE31GJ28C25Y31CM29X31CO318V31GS315B24Y22Q31QR2OK22423C2OM31QV31RD2Z831E3310U25U31H931HB2MR31GS31942NR29Z26M29D29X29G316B2IG31RY31EB31S831H731FS29X2BP26E1328G318X24Z2YZ28T21U29Z26N31B031CP2Z726F2BJ31QG27626A1B2LY1B276272313S29X312L24Z26Y31TA22J31TC26Z31732NR31M926W31RF314R2BW27Z26W27K311D2IQ2Z61C2Z627323F2MB15313N2HD2IK1B2BX25R28I1C28I31TM28T1B28625R2LI1C2LI2I61C27S26S24R2AD1B2G625R2BJ1C2BJ25R31TV2Z631UJ2I92KA1C2KA26O2432BE1B2KG31UY2C62M81C2M831NB31OE2KA25S315E31GW2KW27Z23Z23V1J24Y23D2JH23Z21F1331RQ2XW23O24B31UC2KC31UR31OE31UU31V02KA23Z316F21V28I2TO313O31L0311427Z23Y31R528A31M931VR31R923D2XW23S23N31V52I031W024Z31UT31CA31UK2C631W327623Z31OK31WX24B31VN23D31W431VS31VU27623O31VM311D2AH25R31VA31VC31UG31UI31WW31HG31WR2I931US31UU2FP1C2FP25R314H1C314H25R2NG1C2NG25R31M91C31M925R2HX1C2HX31W528M28I23Z25723731VO27S31VR31VT22Q31VV26R31V52W431XQ31OE31XT31XF2C631XN2FP31Y62GH31Y8319931YC31WX31X531YG31X726Z31UC31MQ31XL31WV31VE31WX31W628I31LC1Y2BT24321Y28424325221F31PW29K2FO2572AN2192ST31QF2BJ25N31SF310N31Q8315Q28J24J31QC31QM21V2LY21V2C231ZT28I25E31F62LK31QC318Z2T92LZ2NP2IH31PG2AF132JH31QP31RA25Y2232LY2232SZ32052V731F62YU31QC2KA25U2K129X2XP31S531RY25Y31F62OA31QC2HX26M31MO22T31FE31SF1428I316O2LY2JH2TY31QC2JH26I25731CZ2JY31SR320R24Z26M2JN2UG24Z26I24J31CZ24J2CD26F25723N24X321U26F31EZ2Z6316A26N2NZ24Z23A2BT314S2BX26Z25V26R24X22Q2M82VY319O2TG310J2OX2YM22Z2UQ322T25O321S31O131H7321X22421Q321Z2ON24J32232A732262NU32282O1322A31PD2BU2LY322G322I322K322M31WZ24Z322A2ZC2O2322T284322V322X28A27S321W2K2323232202G3322428I323831KS314Y2T5323C316A323E2JO27Z322H322J322L276322N2GH28C323M24Z322R323O322U2ZG323S2Y6322Z323W323326F31V4322429Z32422A7323A27732462O132482UG21F324B323I324E323K324I324K3185324M322W2Y5323U323022G324S31ET32242KA31T032362BJ324X28C324Z322P323D321T323G324C323J322O323L322Q2BT323P23G323R325F324Q224325I32203150325L31CR26B325O31CR32273245322B3252325V324A323H324D24Z324F311R3260323N325C323Q324N3266321V3230323X2ON23V32362JH325Q31SY3229326J322E323F326M325X3258325Z325A3262325D324O325G324R322023N25F32242HX327532442Z732512BT22J2LY2JR21F26Y323028B2CD26V25V21F24X2392M826V25F32362NG26V31EZ2B2325U327A21F23R21N324C31RM23R323K2B2326T3263322V327Z2K2328124Z32831Z32863288328A3224328C328E32782YM326L328I328K322K328M328O3261322S325D328T28A323332831J328Z2763289328B329M3294328G32493298328L276328N325Z328P324J327G326V25O327F2YM22322528432A5325E322Y326Y327K2ON327M327O326G3239326I323D31P5326M13325724Z26Q25V2K222T25V2CD26Z31Z8322P326T22R2UQ32AZ322W31WF1O31M931SW22R24X22V2LI26I31T529X31T7323L31RF321R25F31CZ2QK321V25N31CZ25N2CD26N32BG318U24C2GX2ZL2UZ2ZO2V22ZR2V531HK31IW31JP25I2S72E223F1D22F21O24Y26P31JM27626C2632ES2CV31K228I24Z23P23U23R23U23P25S23R23M25S23M23K2PJ23M25Z25Z25T25T23U23L23K25Z25S23P24W24V27723L23Q23O26325W32CQ25X25F26625X26723V23M25H2RS25G25C25E23R26625Z23K25G25Z23V26431NF25W31IC2EB2S42RZ2682CJ32DP31JW31IE2UA31I32RV31I024Z31JO25F2CV25S2EK2PU2682DH312D2R724G2PR32E92CJ26825S25D2RS2X932E926232EB2S42692R5312F2DT25X26225W31NF311X31OQ2SE31OT2DU32C12VJ25C2H325H2EB2HQ26C312226T2CM2R32622672HB2X224Z26O2DT2HG2DQ2DS2652VA32FI25Y2662642DL2VA31KL24Z26U2X52CU26225L2CJ26Q32G22F031KC27632GE25I32GG32GI25D27132G926225X2X127726625I25C32F22XA2X832G72QL247313I2FJ2Q92VV26K2QU2S42EF25J2QZ2R12PV27727026532E825D32FM25D26U32FM2VM32C132FZ26532G131KB2PX32EE31JO32G832DP2R632GY32ED310025D2HK2PK32HK27632HO32HQ32EO2CM25U2R72S432EO2D82RO26S32C431K332ID2EL25D2RO2S12ET31IV26C2CM26031OS2Q12EB2ZU2RT2ZW32I624Z2RZ32FT32FV2VJ32FH27726V31JR2CL25M24W31HI24Z32IL32IT2CJ32IV25D32EW32EY31JY2VA2SO32IR32IM2CJ2VR312D2DQ32EV32EX32EZ310232J82ZZ2VF32CD310W32EE32IO26232IQ32KA32I832JR32K42EU27726P312E2RT2Q231NF26W32F2311Z2R922921421324331IG25U25I25J2632CM32GH2PU31NI31222HC2CJ2CL2CN32DA2H626532KZ32L132L332GI2CX24E24326826332L02DR2R624325Z31IK265');local n=bit and bit.bxor or function(l,e)local o,n=1,0 while l>0 and e>0 do local d,c=l%2,e%2 if d~=c then n=n+o end l,e,o=(l-d)/2,(e-c)/2,o*2 end if l<e then l=e end while l>0 do local e=l%2 if e>0 then n=n+o end l,o=(l-e)/2,o*2 end return n end local function l(e,l,o)if o then local l=(e/2^(l-1))%2^((o-1)-(l-1)+1);return l-l%1;else local l=2^(l-1);return(e%(l+l)>=l)and 1 or 0;end;end;local o=1;local function e()local e,l,d,c=t(c,o,o+3);e=n(e,179)l=n(l,179)d=n(d,179)c=n(c,179)o=o+4;return(c*16777216)+(d*65536)+(l*256)+e;end;local function a()local l=n(t(c,o,o),179);o=o+1;return l;end;local function Z()local o=e();local n=e();local d=1;local e=(l(n,1,20)*(2^32))+o;local o=l(n,21,31);local l=((-1)^l(n,32));if(o==0)then if(e==0)then return l*0;else o=1;d=0;end;elseif(o==2047)then return(e==0)and(l*(1/0))or(l*(0/0));end;return C(l,o-1023)*(d+(e/(2^52)));end;local C=e;local function h(l)local e;if(not l)then l=C();if(l==0)then return'';end;end;e=d(c,o,o+l-1);o=o+l;local o={}for l=1,#e do o[l]=r(n(t(d(e,l,l)),179))end return J(o);end;local o=e;local function C(...)return{...},i('#',...)end local function A()local f={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};local o={0,0,0,0,0,0,0,0,0,0,0};local d={};local c={f,nil,o,nil,d};c[4]=a();for l=1,e()do o[l-1]=A();end;for c=1,e()do local d=n(e(),124);local e=n(e(),232);local n=l(d,1,2);local o=l(e,1,11);local o={o,l(d,3,11),nil,nil,e};if(n==0)then o[3]=l(d,12,20);o[5]=l(d,21,29);elseif(n==1)then o[3]=l(e,12,33);elseif(n==2)then o[3]=l(e,12,32)-1048575;elseif(n==3)then o[3]=l(e,12,32)-1048575;o[5]=l(d,21,29);end;f[c]=o;end;local l=e()local e={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};for n=1,l do local o=a();local l;if(o==0)then l=(a()~=0);elseif(o==1)then l=Z();elseif(o==3)then l=h();end;e[n]=l;end;c[2]=e return c;end;local function F(l,r,t)local n=l[1];local e=l[2];local o=l[3];local l=l[4];return function(...)local n=n;local d=e;local s=o;local a=l;local Z=C local o=1;local c=-1;local R={};local C={...};local i=i('#',...)-1;local J={};local e={};for l=0,i do if(l>=a)then R[l-a]=C[l+1];else e[l]=C[l+1];end;end;local B=i-a+1 local l;local a;while true do l=n[o];a=l[1];if a<=63 then if a<=31 then if a<=15 then if a<=7 then if a<=3 then if a<=1 then if a>0 then local C;local t;local Z;local i;local a;a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];Z={};t=0;C=a+l[3]-1;for l=a+1,C do t=t+1;Z[t]=e[l];end;e[a](f(Z,1,C-a));c=a;else if(e[l[2]]==e[l[5]])then o=o+1;else o=o+l[3];end;end;elseif a==2 then local o=l[2];local d={};local n=0;local l=o+l[3]-1;for l=o+1,l do n=n+1;d[n]=e[l];end;e[o](f(d,1,l-o));c=o;else local a;local h,a;local i;local a;local C;local J;local r;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];r=l[2];J=e[l[3]];e[r+1]=J;e[r]=J[d[l[5]]];o=o+1;l=n[o];r=l[2];C={};a=0;i=r+l[3]-1;for l=r+1,i do a=a+1;C[a]=e[l];end;h,i=Z(e[r](f(C,1,i-r)));i=i+r-1;a=0;for l=r,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];r=l[2];C={};a=0;i=c;for l=r+1,i do a=a+1;C[a]=e[l];end;h,i=Z(e[r](f(C,1,i-r)));i=i+r-1;a=0;for l=r,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];r=l[2];C={};a=0;i=c;for l=r+1,i do a=a+1;C[a]=e[l];end;h={e[r](f(C,1,i-r))};i=r+l[5]-2;a=0;for l=r,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];o=o+l[3];end;elseif a<=5 then if a==4 then local a;local J,a;local i;local a;local h;local F;local C;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];C=l[2];F=e[l[3]];e[C+1]=F;e[C]=F[d[l[5]]];o=o+1;l=n[o];C=l[2];h={};a=0;i=C+l[3]-1;for l=C+1,i do a=a+1;h[a]=e[l];end;J,i=Z(e[C](f(h,1,i-C)));i=i+C-1;a=0;for l=C,i do a=a+1;e[l]=J[a];end;c=i;o=o+1;l=n[o];C=l[2];h={};a=0;i=c;for l=C+1,i do a=a+1;h[a]=e[l];end;J,i=Z(e[C](f(h,1,i-C)));i=i+C-1;a=0;for l=C,i do a=a+1;e[l]=J[a];end;c=i;o=o+1;l=n[o];C=l[2];h={};a=0;i=c;for l=C+1,i do a=a+1;h[a]=e[l];end;J={e[C](f(h,1,i-C))};i=C+l[5]-2;a=0;for l=C,i do a=a+1;e[l]=J[a];end;c=i;o=o+1;l=n[o];o=o+l[3];else e[l[2]]=(l[3]~=0);o=o+1;end;elseif a==6 then local i;local t;local Z;local C;local a;a=l[2];C=e[l[3]];e[a+1]=C;e[a]=C[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];Z={};t=0;i=a+l[3]-1;for l=a+1,i do t=t+1;Z[t]=e[l];end;e[a](f(Z,1,i-a));c=a;else local h;local Z;local t;local C;local i;local a;e[l[2]][e[l[3]]]=d[l[5]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];a=l[2];C={};t=0;Z=a+l[3]-1;for l=a+1,Z do t=t+1;C[t]=e[l];end;h={e[a](f(C,1,Z-a))};Z=a+l[5]-2;t=0;for l=a,Z do t=t+1;e[l]=h[t];end;c=Z;o=o+1;l=n[o];if not e[l[2]]then o=o+1;else o=o+l[3];end;end;elseif a<=11 then if a<=9 then if a==8 then e[l[2]][e[l[3]]]=d[l[5]];else local a;local J,a;local i;local a;local h;local F;local C;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];C=l[2];F=e[l[3]];e[C+1]=F;e[C]=F[d[l[5]]];o=o+1;l=n[o];C=l[2];h={};a=0;i=C+l[3]-1;for l=C+1,i do a=a+1;h[a]=e[l];end;J,i=Z(e[C](f(h,1,i-C)));i=i+C-1;a=0;for l=C,i do a=a+1;e[l]=J[a];end;c=i;o=o+1;l=n[o];C=l[2];h={};a=0;i=c;for l=C+1,i do a=a+1;h[a]=e[l];end;J,i=Z(e[C](f(h,1,i-C)));i=i+C-1;a=0;for l=C,i do a=a+1;e[l]=J[a];end;c=i;o=o+1;l=n[o];C=l[2];h={};a=0;i=c;for l=C+1,i do a=a+1;h[a]=e[l];end;J={e[C](f(h,1,i-C))};i=C+l[5]-2;a=0;for l=C,i do a=a+1;e[l]=J[a];end;c=i;o=o+1;l=n[o];o=o+l[3];end;elseif a>10 then local h;local Z;local r;local C;local i;local a;a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];C={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;C[r]=e[l];end;h={e[a](f(C,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=h[r];end;c=Z;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];C={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;C[r]=e[l];end;h={e[a](f(C,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=h[r];end;c=Z;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];else local h;local i;local a;local C;local Z;r[l[3]]=e[l[2]];o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];Z=l[2];C={};a=0;i=Z+l[3]-1;for l=Z+1,i do a=a+1;C[a]=e[l];end;h={e[Z](f(C,1,i-Z))};i=Z+l[5]-2;a=0;for l=Z,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];if(e[l[2]]==d[l[5]])then o=o+1;else o=o+l[3];end;end;elseif a<=13 then if a>12 then local Z;local a;local t;local d;r[l[3]]=e[l[2]];o=o+1;l=n[o];e[l[2]]={};o=o+1;l=n[o];r[l[3]]=e[l[2]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];for l=l[2],l[3]do e[l]=nil;end;o=o+1;l=n[o];d=l[2];t={};a=0;Z=d+l[3]-1;for l=d+1,Z do a=a+1;t[a]=e[l];end;e[d](f(t,1,Z-d));c=d;else local n=l[2];local d=c;local o={};local l=0;for n=n,d do l=l+1;o[l]=e[n];end;do return f(o,1,l)end;end;elseif a>14 then local a;local h,a;local r;local a;local C;local J;local i;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];i=l[2];J=e[l[3]];e[i+1]=J;e[i]=J[d[l[5]]];o=o+1;l=n[o];i=l[2];C={};a=0;r=i+l[3]-1;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h={e[i](f(C,1,r-i))};r=i+l[5]-2;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];o=o+l[3];else if not e[l[2]]then o=o+1;else o=o+l[3];end;end;elseif a<=23 then if a<=19 then if a<=17 then if a==16 then if e[l[2]]then o=o+1;else o=o+l[3];end;else local c=l[2];local d={};for l=1,#J do local l=J[l];for o=0,#l do local l=l[o];local n=l[1];local o=l[2];if n==e and o>=c then d[o]=n[o];l[1]=d;end;end;end;end;elseif a>18 then e[l[2]]={};else if(e[l[2]]~=d[l[5]])then o=o+1;else o=o+l[3];end;end;elseif a<=21 then if a>20 then local h;local C;local Z;local r;local i;local a;a=l[2];i={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=C[r];end;c=Z;o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];a=l[2];i={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=C[r];end;c=Z;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];a=l[2];i={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;i[r]=e[l];end;e[a](f(i,1,Z-a));c=a;o=o+1;l=n[o];a=l[2];h=e[l[3]];e[a+1]=h;e[a]=h[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];i={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=C[r];end;c=Z;else local C;local Z;local t;local i;local a;r[l[3]]=e[l[2]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]][e[l[3]]]=d[l[5]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];a=l[2];i={};t=0;Z=a+l[3]-1;for l=a+1,Z do t=t+1;i[t]=e[l];end;e[a](f(i,1,Z-a));c=a;o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];C=e[l[3]];e[a+1]=C;e[a]=C[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];i={};t=0;Z=a+l[3]-1;for l=a+1,Z do t=t+1;i[t]=e[l];end;e[a](f(i,1,Z-a));c=a;o=o+1;l=n[o];do return end;end;elseif a>22 then for l=l[2],l[3]do e[l]=nil;end;else local i;local r;local Z;local t;local a;a=l[2];t=e[l[3]];e[a+1]=t;e[a]=t[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=(l[3]~=0);o=o+1;l=n[o];a=l[2];Z={};r=0;i=a+l[3]-1;for l=a+1,i do r=r+1;Z[r]=e[l];end;e[a](f(Z,1,i-a));c=a;end;elseif a<=27 then if a<=25 then if a>24 then local C;local Z;local a;local i;local r;r=l[2];i={};a=0;Z=r+l[3]-1;for l=r+1,Z do a=a+1;i[a]=e[l];end;C={e[r](f(i,1,Z-r))};Z=r+l[5]-2;a=0;for l=r,Z do a=a+1;e[l]=C[a];end;c=Z;o=o+1;l=n[o];for l=l[2],l[3]do e[l]=nil;end;o=o+1;l=n[o];e[l[2]]={};o=o+1;l=n[o];for l=l[2],l[3]do e[l]=nil;end;o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];if not e[l[2]]then o=o+1;else o=o+l[3];end;else local o=l[2];local d={};local n=0;local l=o+l[3]-1;for l=o+1,l do n=n+1;d[n]=e[l];end;e[o](f(d,1,l-o));c=o;end;elseif a==26 then if(e[l[2]]~=e[l[5]])then o=o+1;else o=o+l[3];end;else e[l[2]]=F(s[l[3]],nil,t);end;elseif a<=29 then if a==28 then local i;local r;local Z;local t;local a;a=l[2];t=e[l[3]];e[a+1]=t;e[a]=t[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];a=l[2];Z={};r=0;i=a+l[3]-1;for l=a+1,i do r=r+1;Z[r]=e[l];end;e[a](f(Z,1,i-a));c=a;else local C;local Z;local t;local i;local a;e[l[2]]=r[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];a=l[2];i={};t=0;Z=a+l[3]-1;for l=a+1,Z do t=t+1;i[t]=e[l];end;e[a](f(i,1,Z-a));c=a;o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];C=e[l[3]];e[a+1]=C;e[a]=C[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];i={};t=0;Z=a+l[3]-1;for l=a+1,Z do t=t+1;i[t]=e[l];end;e[a](f(i,1,Z-a));c=a;o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];C=e[l[3]];e[a+1]=C;e[a]=C[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=(l[3]~=0);o=o+1;l=n[o];a=l[2];i={};t=0;Z=a+l[3]-1;for l=a+1,Z do t=t+1;i[t]=e[l];end;e[a](f(i,1,Z-a));c=a;o=o+1;l=n[o];o=o+l[3];end;elseif a>30 then for l=l[2],l[3]do e[l]=nil;end;else local C;local Z;local a;local i;local t;e[l[2]]=r[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];t=l[2];i={};a=0;Z=t+l[3]-1;for l=t+1,Z do a=a+1;i[a]=e[l];end;C={e[t](f(i,1,Z-t))};Z=t+l[5]-2;a=0;for l=t,Z do a=a+1;e[l]=C[a];end;c=Z;o=o+1;l=n[o];if(e[l[2]]~=d[l[5]])then o=o+1;else o=o+l[3];end;end;elseif a<=47 then if a<=39 then if a<=35 then if a<=33 then if a>32 then local o=l[2];local n={};local l=0;local d=c;for o=o+1,d do l=l+1;n[l]=e[o];end;local d,n=Z(e[o](f(n,1,d-o)));n=n+o-1;l=0;for o=o,n do l=l+1;e[o]=d[l];end;c=n;else e[l[2]]=t[d[l[3]]];end;elseif a>34 then local Z;local C;local t;local r;local i;local a;e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];i={};r=0;t=a+l[3]-1;for l=a+1,t do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,t-a))};t=a+l[5]-2;r=0;for l=a,t do r=r+1;e[l]=C[r];end;c=t;o=o+1;l=n[o];a=l[2];Z=e[l[3]];e[a+1]=Z;e[a]=Z[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];i={};r=0;t=a+l[3]-1;for l=a+1,t do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,t-a))};t=a+l[5]-2;r=0;for l=a,t do r=r+1;e[l]=C[r];end;c=t;o=o+1;l=n[o];a=l[2];Z=e[l[3]];e[a+1]=Z;e[a]=Z[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];i={};r=0;t=a+l[3]-1;for l=a+1,t do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,t-a))};t=a+l[5]-2;r=0;for l=a,t do r=r+1;e[l]=C[r];end;c=t;o=o+1;l=n[o];a=l[2];Z=e[l[3]];e[a+1]=Z;e[a]=Z[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];else e[l[2]]=e[l[3]][d[l[5]]];end;elseif a<=37 then if a==36 then if(e[l[2]]==d[l[5]])then o=o+1;else o=o+l[3];end;else local a=s[l[3]];local c;local d={};c=I({},{__index=function(o,l)local l=d[l];return l[1][l[2]];end,__newindex=function(e,l,o)local l=d[l]l[1][l[2]]=o;end;});for c=1,l[5]do o=o+1;local l=n[o];if l[1]==87 then d[c-1]={e,l[3]};else d[c-1]={r,l[3]};end;J[#J+1]=d;end;e[l[2]]=F(a,c,t);end;elseif a==38 then local t;local a;local Z;local d;r[l[3]]=e[l[2]];o=o+1;l=n[o];e[l[2]]={};o=o+1;l=n[o];r[l[3]]=e[l[2]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];for l=l[2],l[3]do e[l]=nil;end;o=o+1;l=n[o];d=l[2];Z={};a=0;t=d+l[3]-1;for l=d+1,t do a=a+1;Z[a]=e[l];end;e[d](f(Z,1,t-d));c=d;o=o+1;l=n[o];o=o+l[3];else o=o+l[3];end;elseif a<=43 then if a<=41 then if a>40 then local l=l[2];c=l+B-1;for o=l,c do local l=R[o-l];e[o]=l;end;else local i;local r;local t;local Z;local a;a=l[2];Z=e[l[3]];e[a+1]=Z;e[a]=Z[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];a=l[2];t={};r=0;i=a+l[3]-1;for l=a+1,i do r=r+1;t[r]=e[l];end;e[a](f(t,1,i-a));c=a;end;elseif a>42 then e[l[2]]=r[l[3]];else local n=l[2];local d=n+l[3]-2;local o={};local l=0;for n=n,d do l=l+1;o[l]=e[n];end;do return f(o,1,l)end;end;elseif a<=45 then if a>44 then local n=l[2];local a={};local o=0;local d=c;for l=n+1,d do o=o+1;a[o]=e[l];end;local d={e[n](f(a,1,d-n))};local l=n+l[5]-2;o=0;for l=n,l do o=o+1;e[l]=d[o];end;c=l;else e[l[2]]={};end;elseif a==46 then local a;local C,a;local t;local a;local i;local h;local r;e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];r=l[2];h=e[l[3]];e[r+1]=h;e[r]=h[d[l[5]]];o=o+1;l=n[o];r=l[2];i={};a=0;t=r+l[3]-1;for l=r+1,t do a=a+1;i[a]=e[l];end;C,t=Z(e[r](f(i,1,t-r)));t=t+r-1;a=0;for l=r,t do a=a+1;e[l]=C[a];end;c=t;o=o+1;l=n[o];r=l[2];i={};a=0;t=c;for l=r+1,t do a=a+1;i[a]=e[l];end;C={e[r](f(i,1,t-r))};t=r+l[5]-2;a=0;for l=r,t do a=a+1;e[l]=C[a];end;c=t;o=o+1;l=n[o];o=o+l[3];else do return end;end;elseif a<=55 then if a<=51 then if a<=49 then if a==48 then e[l[2]]=#e[l[3]];else local h;local Z;local t;local i;local C;local a;e[l[2]]=r[l[3]];o=o+1;l=n[o];e[l[2]][e[l[3]]]=d[l[5]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];C=e[l[3]];e[a+1]=C;e[a]=C[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];a=l[2];i={};t=0;Z=a+l[3]-1;for l=a+1,Z do t=t+1;i[t]=e[l];end;h={e[a](f(i,1,Z-a))};Z=a+l[5]-2;t=0;for l=a,Z do t=t+1;e[l]=h[t];end;c=Z;o=o+1;l=n[o];if e[l[2]]then o=o+1;else o=o+l[3];end;end;elseif a==50 then local o=l[2];local d={};local l=0;local n=c;for o=o+1,n do l=l+1;d[l]=e[o];end;local d,n=Z(e[o](f(d,1,n-o)));n=n+o-1;l=0;for o=o,n do l=l+1;e[o]=d[l];end;c=n;else local C;local t;local Z;local i;local a;a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];Z={};t=0;C=a+l[3]-1;for l=a+1,C do t=t+1;Z[t]=e[l];end;e[a](f(Z,1,C-a));c=a;end;elseif a<=53 then if a>52 then local h;local Z;local t;local C;local i;local a;a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];C={};t=0;Z=a+l[3]-1;for l=a+1,Z do t=t+1;C[t]=e[l];end;h={e[a](f(C,1,Z-a))};Z=a+l[5]-2;t=0;for l=a,Z do t=t+1;e[l]=h[t];end;c=Z;o=o+1;l=n[o];if not e[l[2]]then o=o+1;else o=o+l[3];end;else e[l[2]][d[l[3]]]=e[l[5]];end;elseif a==54 then t[d[l[3]]]=e[l[2]];else local a;local h,a;local i;local a;local C;local J;local r;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];r=l[2];J=e[l[3]];e[r+1]=J;e[r]=J[d[l[5]]];o=o+1;l=n[o];r=l[2];C={};a=0;i=r+l[3]-1;for l=r+1,i do a=a+1;C[a]=e[l];end;h,i=Z(e[r](f(C,1,i-r)));i=i+r-1;a=0;for l=r,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];r=l[2];C={};a=0;i=c;for l=r+1,i do a=a+1;C[a]=e[l];end;h,i=Z(e[r](f(C,1,i-r)));i=i+r-1;a=0;for l=r,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];r=l[2];C={};a=0;i=c;for l=r+1,i do a=a+1;C[a]=e[l];end;h={e[r](f(C,1,i-r))};i=r+l[5]-2;a=0;for l=r,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];o=o+l[3];end;elseif a<=59 then if a<=57 then if a>56 then local o=l[2];local n=e[l[3]];e[o+1]=n;e[o]=n[d[l[5]]];else do return end;end;elseif a>58 then if(e[l[2]]==d[l[5]])then o=o+1;else o=o+l[3];end;else local a;local h,a;local r;local a;local C;local J;local i;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];i=l[2];J=e[l[3]];e[i+1]=J;e[i]=J[d[l[5]]];o=o+1;l=n[o];i=l[2];C={};a=0;r=i+l[3]-1;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h={e[i](f(C,1,r-i))};r=i+l[5]-2;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];o=o+l[3];end;elseif a<=61 then if a==60 then local Z;local r;local i;local a;e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];i={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;i[r]=e[l];end;e[a](f(i,1,Z-a));c=a;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];i={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;i[r]=e[l];end;e[a](f(i,1,Z-a));c=a;else local C;local i;local t;local Z;local a;r[l[3]]=e[l[2]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];a=l[2];Z={};t=0;i=a+l[3]-1;for l=a+1,i do t=t+1;Z[t]=e[l];end;e[a](f(Z,1,i-a));c=a;o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];C=e[l[3]];e[a+1]=C;e[a]=C[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];Z={};t=0;i=a+l[3]-1;for l=a+1,i do t=t+1;Z[t]=e[l];end;e[a](f(Z,1,i-a));c=a;o=o+1;l=n[o];o=o+l[3];end;elseif a>62 then local n=l[2];local c=l[5];local l=n+2;local d={e[n](e[n+1],e[l])};for o=1,c do e[l+o]=d[o];end;local n=e[n+3];if n then e[l]=n else o=o+1;end;else e[l[2]]=d[l[3]];end;elseif a<=95 then if a<=79 then if a<=71 then if a<=67 then if a<=65 then if a>64 then e[l[2]][e[l[3]]]=d[l[5]];else local l=l[2];local o={};local n=c;for l=l+1,n do o[#o+1]=e[l];end;do return e[l](f(o,1,n-l))end;end;elseif a>66 then e[l[2]]=t[d[l[3]]];else local t;local a;local Z,a;local f;e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]][e[l[3]]]=d[l[5]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];f=l[2];Z,a={e[f]()};a=f+l[5]-2;t=0;for l=f,a do t=t+1;e[l]=Z[t];end;c=a;o=o+1;l=n[o];if not e[l[2]]then o=o+1;else o=o+l[3];end;end;elseif a<=69 then if a==68 then local n=l[2];local d=c;local o={};local l=0;for n=n,d do l=l+1;o[l]=e[n];end;do return f(o,1,l)end;else e[l[2]]=(l[3]~=0);end;elseif a>70 then local n=l[2];local o=e[l[3]];e[n+1]=o;e[n]=o[d[l[5]]];else r[l[3]]=e[l[2]];end;elseif a<=75 then if a<=73 then if a>72 then e[l[2]]=e[l[3]][e[l[5]]];else local o=l[2];local n=(l[5]-1)*50;local d=e[o];local l=c-o;for l=1,l do d[n+l]=e[o+l]end;end;elseif a==74 then local l=l[2];local n=e[l];local o=c-l;for o=1,o do n[o]=e[l+o]end;else if(e[l[2]]~=d[l[5]])then o=o+1;else o=o+l[3];end;end;elseif a<=77 then if a==76 then local a;local h,a;local i;local a;local C;local J;local r;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];r=l[2];J=e[l[3]];e[r+1]=J;e[r]=J[d[l[5]]];o=o+1;l=n[o];r=l[2];C={};a=0;i=r+l[3]-1;for l=r+1,i do a=a+1;C[a]=e[l];end;h,i=Z(e[r](f(C,1,i-r)));i=i+r-1;a=0;for l=r,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];r=l[2];C={};a=0;i=c;for l=r+1,i do a=a+1;C[a]=e[l];end;h,i=Z(e[r](f(C,1,i-r)));i=i+r-1;a=0;for l=r,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];r=l[2];C={};a=0;i=c;for l=r+1,i do a=a+1;C[a]=e[l];end;h={e[r](f(C,1,i-r))};i=r+l[5]-2;a=0;for l=r,i do a=a+1;e[l]=h[a];end;c=i;o=o+1;l=n[o];o=o+l[3];else local l=l[2];local n=e[l];local o=c-l;for o=1,o do n[o]=e[l+o]end;end;elseif a>78 then if(e[l[2]]~=e[l[5]])then o=o+1;else o=o+l[3];end;else e[l[2]]=e[l[3]];end;elseif a<=87 then if a<=83 then if a<=81 then if a>80 then local o=l[2];local d,n={e[o]()};local n=o+l[5]-2;local l=0;for o=o,n do l=l+1;e[o]=d[l];end;c=n;else local a=s[l[3]];local c;local d={};c=I({},{__index=function(o,l)local l=d[l];return l[1][l[2]];end,__newindex=function(e,l,o)local l=d[l]l[1][l[2]]=o;end;});for c=1,l[5]do o=o+1;local l=n[o];if l[1]==87 then d[c-1]={e,l[3]};else d[c-1]={r,l[3]};end;J[#J+1]=d;end;e[l[2]]=F(a,c,t);end;elseif a==82 then local i;local r;local Z;local t;local a;a=l[2];t=e[l[3]];e[a+1]=t;e[a]=t[d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];a=l[2];Z={};r=0;i=a+l[3]-1;for l=a+1,i do r=r+1;Z[r]=e[l];end;e[a](f(Z,1,i-a));c=a;o=o+1;l=n[o];o=o+l[3];else e[l[2]]=r[l[3]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]][e[l[3]]]=d[l[5]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];if(e[l[2]]==e[l[5]])then o=o+1;else o=o+l[3];end;end;elseif a<=85 then if a==84 then if(e[l[2]]==e[l[5]])then o=o+1;else o=o+l[3];end;else if not e[l[2]]then o=o+1;else o=o+l[3];end;end;elseif a==86 then if e[l[2]]then o=o+1;else o=o+l[3];end;else e[l[2]]=e[l[3]];end;elseif a<=91 then if a<=89 then if a>88 then local n=l[2];local d={};local o=0;local l=n+l[3]-1;for l=n+1,l do o=o+1;d[o]=e[l];end;local d,l=Z(e[n](f(d,1,l-n)));l=l+n-1;o=0;for l=n,l do o=o+1;e[l]=d[o];end;c=l;else local h;local Z;local r;local C;local i;local a;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];C={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;C[r]=e[l];end;h={e[a](f(C,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=h[r];end;c=Z;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];C={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;C[r]=e[l];end;h={e[a](f(C,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=h[r];end;c=Z;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];end;elseif a>90 then local l=l[2];c=l+B-1;for o=l,c do local l=R[o-l];e[o]=l;end;else o=o+l[3];end;elseif a<=93 then if a==92 then e[l[2]]=e[l[3]][e[l[5]]];else e[l[2]][d[l[3]]]=d[l[5]];end;elseif a==94 then e[l[2]][d[l[3]]]=e[l[5]];else local a,a;local J;local h;local i;local r;local C;local a;a=l[2];C={};r=0;i=a+l[3]-1;for l=a+1,i do r=r+1;C[r]=e[l];end;h={e[a](f(C,1,i-a))};i=a+l[5]-2;r=0;for l=a,i do r=r+1;e[l]=h[r];end;c=i;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];a=l[2];J=e[l[3]];e[a+1]=J;e[a]=J[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];C={};r=0;i=a+l[3]-1;for l=a+1,i do r=r+1;C[r]=e[l];end;h={e[a](f(C,1,i-a))};i=a+l[5]-2;r=0;for l=a,i do r=r+1;e[l]=h[r];end;c=i;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];a=l[2];J=e[l[3]];e[a+1]=J;e[a]=J[d[l[5]]];o=o+1;l=n[o];a=l[2];C={};r=0;i=a+l[3]-1;for l=a+1,i do r=r+1;C[r]=e[l];end;h,i=Z(e[a](f(C,1,i-a)));i=i+a-1;r=0;for l=a,i do r=r+1;e[l]=h[r];end;c=i;o=o+1;l=n[o];a=l[2];C={};r=0;i=c;for l=a+1,i do r=r+1;C[r]=e[l];end;h,i=Z(e[a](f(C,1,i-a)));i=i+a-1;r=0;for l=a,i do r=r+1;e[l]=h[r];end;c=i;end;elseif a<=111 then if a<=103 then if a<=99 then if a<=97 then if a>96 then local a;local C,a;local t;local r;local i;local h;local a;e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];a=l[2];h=e[l[3]];e[a+1]=h;e[a]=h[d[l[5]]];o=o+1;l=n[o];a=l[2];i={};r=0;t=a+l[3]-1;for l=a+1,t do r=r+1;i[r]=e[l];end;C,t=Z(e[a](f(i,1,t-a)));t=t+a-1;r=0;for l=a,t do r=r+1;e[l]=C[r];end;c=t;o=o+1;l=n[o];a=l[2];i={};r=0;t=c;for l=a+1,t do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,t-a))};t=a+l[5]-2;r=0;for l=a,t do r=r+1;e[l]=C[r];end;c=t;o=o+1;l=n[o];o=o+l[3];else local n=l[2];local d=l[5];local l=n+2;local c={e[n](e[n+1],e[l])};for o=1,d do e[l+o]=c[o];end;local n=e[n+3];if n then e[l]=n else o=o+1;end;end;elseif a>98 then local i;local t;local C;local Z;local a;a=l[2];Z=e[l[3]];e[a+1]=Z;e[a]=Z[d[l[5]]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];a=l[2];C={};t=0;i=a+l[3]-1;for l=a+1,i do t=t+1;C[t]=e[l];end;e[a](f(C,1,i-a));c=a;else e[l[2]]=(l[3]~=0);o=o+1;end;elseif a<=101 then if a==100 then local a;local C,a;local t;local r;local i;local h;local a;e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];a=l[2];h=e[l[3]];e[a+1]=h;e[a]=h[d[l[5]]];o=o+1;l=n[o];a=l[2];i={};r=0;t=a+l[3]-1;for l=a+1,t do r=r+1;i[r]=e[l];end;C,t=Z(e[a](f(i,1,t-a)));t=t+a-1;r=0;for l=a,t do r=r+1;e[l]=C[r];end;c=t;o=o+1;l=n[o];a=l[2];i={};r=0;t=c;for l=a+1,t do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,t-a))};t=a+l[5]-2;r=0;for l=a,t do r=r+1;e[l]=C[r];end;c=t;o=o+1;l=n[o];o=o+l[3];else local a;local h,a;local r;local a;local C;local J;local i;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];i=l[2];J=e[l[3]];e[i+1]=J;e[i]=J[d[l[5]]];o=o+1;l=n[o];i=l[2];C={};a=0;r=i+l[3]-1;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h={e[i](f(C,1,r-i))};r=i+l[5]-2;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];o=o+l[3];end;elseif a==102 then local n=l[2];local d={};local o=0;local a=n+l[3]-1;for l=n+1,a do o=o+1;d[o]=e[l];end;local d={e[n](f(d,1,a-n))};local l=n+l[5]-2;o=0;for l=n,l do o=o+1;e[l]=d[o];end;c=l;else t[d[l[3]]]=e[l[2]];end;elseif a<=107 then if a<=105 then if a>104 then local n=l[2];local d={};local o=0;local l=n+l[3]-1;for l=n+1,l do o=o+1;d[o]=e[l];end;local d,l=Z(e[n](f(d,1,l-n)));l=l+n-1;o=0;for l=n,l do o=o+1;e[l]=d[o];end;c=l;else local a;local J,a;local i;local a;local h;local F;local C;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];C=l[2];F=e[l[3]];e[C+1]=F;e[C]=F[d[l[5]]];o=o+1;l=n[o];C=l[2];h={};a=0;i=C+l[3]-1;for l=C+1,i do a=a+1;h[a]=e[l];end;J,i=Z(e[C](f(h,1,i-C)));i=i+C-1;a=0;for l=C,i do a=a+1;e[l]=J[a];end;c=i;o=o+1;l=n[o];C=l[2];h={};a=0;i=c;for l=C+1,i do a=a+1;h[a]=e[l];end;J,i=Z(e[C](f(h,1,i-C)));i=i+C-1;a=0;for l=C,i do a=a+1;e[l]=J[a];end;c=i;o=o+1;l=n[o];C=l[2];h={};a=0;i=c;for l=C+1,i do a=a+1;h[a]=e[l];end;J={e[C](f(h,1,i-C))};i=C+l[5]-2;a=0;for l=C,i do a=a+1;e[l]=J[a];end;c=i;o=o+1;l=n[o];o=o+l[3];end;elseif a==106 then r[l[3]]=e[l[2]];else e[l[2]][d[l[3]]]=d[l[5]];end;elseif a<=109 then if a==108 then local C;local Z;local i;local a;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];i={};Z=0;C=a+l[3]-1;for l=a+1,C do Z=Z+1;i[Z]=e[l];end;e[a](f(i,1,C-a));c=a;o=o+1;l=n[o];e[l[2]]=r[l[3]];o=o+1;l=n[o];if e[l[2]]then o=o+1;else o=o+l[3];end;else e[l[2]]=d[l[3]];end;elseif a>110 then e[l[2]]=e[l[3]][d[l[5]]];else e[l[2]]=#e[l[3]];end;elseif a<=119 then if a<=115 then if a<=113 then if a==112 then e[l[2]]=(l[3]~=0);else local n=l[2];local a={};local o=0;local d=n+l[3]-1;for l=n+1,d do o=o+1;a[o]=e[l];end;local d={e[n](f(a,1,d-n))};local l=n+l[5]-2;o=0;for l=n,l do o=o+1;e[l]=d[o];end;c=l;end;elseif a==114 then local o=l[2];local d,n={e[o]()};local n=o+l[5]-2;local l=0;for o=o,n do l=l+1;e[o]=d[l];end;c=n;else local n=l[2];local d={};local o=0;local a=c;for l=n+1,a do o=o+1;d[o]=e[l];end;local d={e[n](f(d,1,a-n))};local l=n+l[5]-2;o=0;for l=n,l do o=o+1;e[l]=d[o];end;c=l;end;elseif a<=117 then if a>116 then local a;local h,a;local r;local a;local C;local J;local i;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];i=l[2];J=e[l[3]];e[i+1]=J;e[i]=J[d[l[5]]];o=o+1;l=n[o];i=l[2];C={};a=0;r=i+l[3]-1;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h={e[i](f(C,1,r-i))};r=i+l[5]-2;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];o=o+l[3];else e[l[2]]=r[l[3]];end;elseif a==118 then local h;local Z;local r;local C;local i;local a;a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];C={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;C[r]=e[l];end;h={e[a](f(C,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=h[r];end;c=Z;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];C={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;C[r]=e[l];end;h={e[a](f(C,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=h[r];end;c=Z;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];a=l[2];i=e[l[3]];e[a+1]=i;e[a]=i[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];else local o=l[2];local l={};local n=c;for o=o+1,n do l[#l+1]=e[o];end;do return e[o](f(l,1,n-o))end;end;elseif a<=123 then if a<=121 then if a>120 then local c=l[2];local n={};for l=1,#J do local l=J[l];for o=0,#l do local l=l[o];local d=l[1];local o=l[2];if d==e and o>=c then n[o]=d[o];l[1]=n;end;end;end;else local h;local C;local Z;local r;local i;local a;t[d[l[3]]]=e[l[2]];o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];i={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=C[r];end;c=Z;o=o+1;l=n[o];a=l[2];h=e[l[3]];e[a+1]=h;e[a]=h[d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];i={};r=0;Z=a+l[3]-1;for l=a+1,Z do r=r+1;i[r]=e[l];end;C={e[a](f(i,1,Z-a))};Z=a+l[5]-2;r=0;for l=a,Z do r=r+1;e[l]=C[r];end;c=Z;o=o+1;l=n[o];if e[l[2]]then o=o+1;else o=o+l[3];end;end;elseif a==122 then local a;local h,a;local r;local a;local C;local J;local i;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];i=l[2];J=e[l[3]];e[i+1]=J;e[i]=J[d[l[5]]];o=o+1;l=n[o];i=l[2];C={};a=0;r=i+l[3]-1;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h,r=Z(e[i](f(C,1,r-i)));r=r+i-1;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];i=l[2];C={};a=0;r=c;for l=i+1,r do a=a+1;C[a]=e[l];end;h={e[i](f(C,1,r-i))};r=i+l[5]-2;a=0;for l=i,r do a=a+1;e[l]=h[a];end;c=r;o=o+1;l=n[o];o=o+l[3];else local C;local Z;local a;local i;local r;e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];r=l[2];i={};a=0;Z=r+l[3]-1;for l=r+1,Z do a=a+1;i[a]=e[l];end;C={e[r](f(i,1,Z-r))};Z=r+l[5]-2;a=0;for l=r,Z do a=a+1;e[l]=C[a];end;c=Z;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];r=l[2];i={};a=0;Z=r+l[3]-1;for l=r+1,Z do a=a+1;i[a]=e[l];end;C={e[r](f(i,1,Z-r))};Z=r+l[5]-2;a=0;for l=r,Z do a=a+1;e[l]=C[a];end;c=Z;o=o+1;l=n[o];if(e[l[2]]==d[l[5]])then o=o+1;else o=o+l[3];end;end;elseif a<=125 then if a==124 then e[l[2]]=F(s[l[3]],nil,t);else local i;local r;local Z;local a;e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];a=l[2];Z={};r=0;i=a+l[3]-1;for l=a+1,i do r=r+1;Z[r]=e[l];end;e[a](f(Z,1,i-a));c=a;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];if e[l[2]]then o=o+1;else o=o+l[3];end;end;elseif a==126 then local C;local Z;local a;local i;local r;e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];e[l[2]]=e[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];e[l[2]]=d[l[3]];o=o+1;l=n[o];r=l[2];i={};a=0;Z=r+l[3]-1;for l=r+1,Z do a=a+1;i[a]=e[l];end;C={e[r](f(i,1,Z-r))};Z=r+l[5]-2;a=0;for l=r,Z do a=a+1;e[l]=C[a];end;c=Z;o=o+1;l=n[o];e[l[2]]=t[d[l[3]]];o=o+1;l=n[o];e[l[2]]=e[l[3]][d[l[5]]];o=o+1;l=n[o];if e[l[2]]then o=o+1;else o=o+l[3];end;else local n=l[2];local d=n+l[3]-2;local o={};local l=0;for n=n,d do l=l+1;o[l]=e[n];end;do return f(o,1,l)end;end;o=o+1;end;end;end;return F(A(),{},S())();
