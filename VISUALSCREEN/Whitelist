@@ -1,15 +1,15 @@
 [
     {
-        "creatorId": "12345678",
+        "creatorId": "8896512278",
         "creatorType": "User",
-        "productId": "Asset Mahal Pokoknya",
+        "productId": "VISUAL_SCREEN",
         "revoked": false
     },
     {
         "creatorId": "57199762",
         "creatorType": "Group",
-        "productId": "Asset Mahal Pokoknya",
-        "ownerUserId": "556677",
+        "productId": "VISUAL_SCREEN",
+        "ownerUserId": "8896512278",
         "revoked": false
     }
 ]
