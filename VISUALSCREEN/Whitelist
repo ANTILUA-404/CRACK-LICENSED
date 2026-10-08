@@ -1,0 +1,15 @@
+[
+    {
+        "creatorId": "12345678",
+        "creatorType": "User",
+        "productId": "Asset Mahal Pokoknya",
+        "revoked": false
+    },
+    {
+        "creatorId": "87654321",
+        "creatorType": "Group",
+        "productId": "Asset Mahal Pokoknya",
+        "ownerUserId": "556677",
+        "revoked": false
+    }
+]
